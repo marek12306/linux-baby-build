@@ -1,0 +1,161 @@
+#!/bin/sh
+# /etc/init.d/wlan for the linux-baby kernel. The initramfs bind-mounts it over
+# the stock script from RAM; the stock file and the storage volume are not
+# changed.
+#
+# Stock (board revision < 9, AR6002): loadAR6000l.sh loads ar6000.ko, boots
+# the chip with /lib/atheros/athwlan.bin, data.patch.hw2_0.bin and
+# calData_ar6102_15dBm.bin (eeprom.AR6002 --setmac patches in the eth0 MAC),
+# then wpa_supplicant (wext) and wpa_cli run on eth1.
+#
+# linux-baby: ath6kl (gzipped modules bind-mounted over /lib/modules) loads the
+# same three files through the firmware loader from a RAM directory; the
+# board data copy gets the eth0 MAC like stock. The interface is renamed to
+# eth1: /etc/network/interfaces, if_mapping, wpa_action and SqueezePlay use
+# it. /usr/sbin/wpa_supplicant is the initramfs' static 2.11 build with the
+# nl80211 driver (the stock 2.9 only has wext, which cannot connect through
+# cfg80211 to the fullMAC ath6kl); the stock wpa_cli talks to it unchanged.
+#
+# Not supported: board revisions >= 9 (AR6003; stock uses /lib/atheros3,
+# untested here), and the /etc/wlan.conf options filterall, gonly, mode_g,
+# maxperf and arpwatch, which need the AR6000 private ioctls (wmiconfig).
+
+IFNAME=eth1
+MODULES=/lib/modules/$(uname -r)
+FW_DIR=/tmp/firmware
+STOCK=/lib/atheros
+
+hwrev=$(sed -ne 's/^Revision[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo)
+hwrev=$(expr "$hwrev" + 0)
+
+# Write bytes (decimal or 0x hex) into a file at a byte offset.
+put_bytes() {
+	file=$1
+	offset=$2
+	shift 2
+	bytes=
+	for b in "$@"; do
+		bytes="$bytes$(printf '\\%03o' "$b")"
+	done
+	printf "$bytes" | dd of="$file" bs=1 seek="$offset" conv=notrunc 2>/dev/null
+}
+
+# eeprom.AR6002 --setmac (AR6kSDK host/tools/eeprom/eeprom.c update_mac()):
+# MAC at byte 10; the 16-bit word at byte 4 is the inverted XOR of all
+# little-endian 16-bit words of the 768-byte board data, itself counted as 0.
+board_data_with_mac() {
+	cp "$1" "$2"
+	put_bytes "$2" 4 0 0
+	put_bytes "$2" 10 $(echo "$3" | sed -e 's/\([0-9a-fA-F][0-9a-fA-F]\)/0x\1/g' -e 's/:/ /g')
+	sum=0
+	for w in $(hexdump -v -e '1/2 "%u\n"' "$2"); do
+		sum=$((sum ^ w))
+	done
+	sum=$((~sum & 0xffff))
+	put_bytes "$2" 4 $((sum & 0xff)) $((sum >> 8))
+}
+
+# Unpack a module to /tmp (RAM) only for loading it.
+load_module() {
+	if grep -q "^$1 " /proc/modules; then
+		return 0
+	fi
+	zcat $MODULES/$1.ko.gz > /tmp/$1.ko || return 1
+	/sbin/insmod /tmp/$1.ko
+	ret=$?
+	rm -f /tmp/$1.ko
+	return $ret
+}
+
+start() {
+	/usr/bin/logger -s "wlan: hw rev: $hwrev"
+	if [ "$hwrev" -ge 9 ]; then
+		/usr/bin/logger -s "wlan: AR6003 boards are not supported by the linux-baby wlan script"
+		return 1
+	fi
+
+	/usr/bin/logger -s "wlan: starting"
+
+	dir=$FW_DIR/ath6k/AR6002/hw2.0
+	mkdir -p $dir
+	ln -sf $STOCK/athwlan.bin $dir/athwlan.bin
+	ln -sf $STOCK/data.patch.hw2_0.bin $dir/data.patch.bin
+
+	# Same MAC address as Ethernet, as stock
+	macaddr=$(cat /sys/class/net/eth0/address 2>/dev/null)
+	if [ -n "$macaddr" ]; then
+		echo "Setting $IFNAME macaddr: $macaddr"
+		board_data_with_mac $STOCK/calData_ar6102_15dBm.bin $dir/bdata.bin "$macaddr"
+	else
+		ln -sf $STOCK/calData_ar6102_15dBm.bin $dir/bdata.bin
+	fi
+	echo -n $FW_DIR > /sys/module/firmware_class/parameters/path
+
+	for m in cfg80211 ath6kl_core ath6kl_sdio; do
+		load_module $m || return 1
+	done
+
+	# ath6kl registers wlan0 once the firmware is up
+	n=0
+	while [ ! -e /sys/class/net/wlan0 ] && [ ! -e /sys/class/net/$IFNAME ]; do
+		n=$((n + 1))
+		if [ $n -gt 10 ]; then
+			/usr/bin/logger -s "wlan: no wlan0 interface"
+			return 1
+		fi
+		sleep 1
+	done
+	if [ -e /sys/class/net/wlan0 ]; then
+		/bin/ip link set dev wlan0 name $IFNAME || return 1
+	fi
+
+	/usr/bin/logger "Starting wpa_supplicant"
+	/usr/sbin/wpa_supplicant -B -Dnl80211 -i$IFNAME -c/etc/wpa_supplicant.conf
+	sleep 1
+
+	/usr/sbin/wpa_cli -B -a/etc/network/wpa_action
+	/usr/bin/logger "Started wpa_supplicant"
+
+	/usr/bin/logger -s "wlan started"
+}
+
+stop() {
+	/usr/bin/logger -s "wlan: stopping"
+
+	killall wpa_cli
+	killall wpa_supplicant
+
+	if [ -r /var/run/udhcpc.$IFNAME.pid ]; then
+		PID=$(cat /var/run/udhcpc.$IFNAME.pid)
+		kill -TERM $PID
+		while kill -0 $PID 2>/dev/null; do
+			sleep 1
+		done
+	fi
+
+	for m in ath6kl_sdio ath6kl_core cfg80211; do
+		if grep -q "^$m " /proc/modules; then
+			/sbin/rmmod $m
+		fi
+	done
+
+	/usr/bin/logger -s "wlan stopped"
+}
+
+case "$1" in
+start)
+	if ! start; then
+		/usr/bin/logger -s "wlan: failed"
+		exit 1
+	fi
+	;;
+stop)
+	stop
+	;;
+*)
+	echo "Usage: $0 {start|stop}"
+	exit 1
+	;;
+esac
+
+exit 0

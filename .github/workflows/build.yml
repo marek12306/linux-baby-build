@@ -1,0 +1,35 @@
+name: Build zImage
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  zimage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev cpio rsync \
+            unzip file wget curl git python3
+
+      - name: Download cache
+        uses: actions/cache@v4
+        with:
+          path: work/dl
+          key: dl-${{ hashFiles('br2-external/configs/*', 'scripts/*', 'tools/ubitui/build.sh') }}-${{ github.sha }}
+          restore-keys: dl-
+
+      - name: Build
+        run: ./build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zImage
+          path: out/
+          if-no-files-found: error

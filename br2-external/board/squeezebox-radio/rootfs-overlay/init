@@ -1,0 +1,189 @@
+#!/bin/sh
+# linux-baby handoff to the stock SqueezeOS root, replacing the stock linuxrc.
+#
+# Stock linuxrc: CramFS root (read-only) plus the "ubifs" volume mounted
+# read-write at /mnt/storage, merged over the whole root by unionfs. Linux
+# has no unionfs, and overlayfs cannot use the volume root as the upper layer
+# of / (its work directory must be outside the upper layer). Each top-level
+# CramFS directory therefore gets its own overlayfs whose upper layer is the
+# same path in the "ubifs" volume, except the pseudo filesystems and /tmp,
+# /var (ramfs from rcS, as on stock). Changed files land exactly where
+# unionfs put them, so settings, installed applets etc. are shared with stock
+# firmware. Not covered: new entries directly in /.
+#
+# Never done here, unlike linuxrc: factory reset (flash_eraseall), MSP430
+# "erase", post-upgrade cleanup of the storage volume.
+#
+# Kernel command line:
+#   root=/dev/mtdblock:<volume>  CramFS volume, as passed by the RedBoot boot
+#                               script (stock os_cmdline); default "cramfs"
+#   squeezebox.no_flash_root=1  stay in this initramfs, NAND unused
+#   squeezebox.readonly=1       mount "ubifs" read-only, changes kept in RAM
+set -eu
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+if grep -qw 'squeezebox.no_flash_root=1' /proc/cmdline; then
+	echo "Running from initramfs only; persistent NAND is intentionally unused"
+	exec /sbin/init
+fi
+
+ROOT=/mnt/root
+# The volume is mounted here first and moved to $ROOT/mnt/storage after the
+# overlays: an overlay on $ROOT/mnt would hide a mount below it.
+STORAGE=/storage
+# overlayfs work directories: same filesystem as the upper layers, outside
+# them. The name predates "linux-baby"; it stays because radios already have
+# this directory in their storage volume.
+WORK=$STORAGE/.mainline-overlayfs
+
+cramfs_vol=cramfs
+for arg in $(cat /proc/cmdline); do
+	case $arg in
+	root=/dev/mtdblock:?*) cramfs_vol=${arg#root=/dev/mtdblock:} ;;
+	esac
+done
+
+# ubi.block=0,<volume> (DT bootargs) exposes it as /dev/ubiblock0_<volume id>
+cramfs_dev=
+for vol in /sys/class/ubi/ubi0_*; do
+	if [ -r "$vol/name" ] && [ "$(cat "$vol/name")" = "$cramfs_vol" ]; then
+		cramfs_dev=/dev/ubiblock0_${vol##*_}
+	fi
+done
+if [ -z "$cramfs_dev" ] || [ ! -b "$cramfs_dev" ]; then
+	echo "No UBI block device for CramFS volume $cramfs_vol (need ubi.mtd=1 ubi.block=0,$cramfs_vol)"
+	exec /bin/sh
+fi
+
+mkdir -p $ROOT
+mount -t cramfs -o ro "$cramfs_dev" $ROOT
+
+mkdir -p $STORAGE
+
+# RAM for the linux-baby-only files and for read-only/fallback upper layers.
+# Detached before switch_root; the mounts made from it keep it alive.
+mkdir -p /ram
+mount -t tmpfs -o mode=0755 tmpfs /ram
+
+# linux-baby-only programs without a stock file to bind over go into a RAM
+# layer below the CramFS one, so the overlay shows them without writing the
+# storage volume, and a same-named file there or in CramFS takes precedence.
+mkdir -p /ram/lower/sbin
+cp -p /squeezeos/ubitui /ram/lower/sbin/ || echo "WARNING: ubitui not copied"
+
+storage_rw=0
+if grep -qw 'squeezebox.readonly=1' /proc/cmdline; then
+	echo "squeezebox.readonly=1: storage read-only, changes are kept in RAM"
+	mount -t ubifs -o ro ubi0:ubifs $STORAGE || true
+elif mount -t ubifs -o noatime ubi0:ubifs $STORAGE; then
+	storage_rw=1
+else
+	# Stock linuxrc would erase the volume here (factory reset).
+	echo "WARNING: read-write mount of ubi0:ubifs failed; no factory reset done"
+	mount -t ubifs -o ro ubi0:ubifs $STORAGE || true
+fi
+
+if [ $storage_rw = 1 ]; then
+	stored=$STORAGE/etc/squeezeos.version
+	if ! cmp -s $ROOT/etc/squeezeos.version $stored; then
+		echo "WARNING: $stored differs from the CramFS version;" \
+			"stock firmware runs its post-upgrade cleanup on its next boot"
+	fi
+	if [ -e $STORAGE/.factoryreset ]; then
+		echo "WARNING: factory reset requested; left to stock firmware"
+	fi
+fi
+
+# Persistent overlay with the upper layer in the storage volume, or a RAM
+# upper layer above the storage copy when storage is not writable. The
+# linux-baby RAM layer, if any, is the lowest.
+overlay_dir() {
+	dir=$1
+	base=$ROOT/$dir
+
+	if [ -d /ram/lower/$dir ]; then
+		base=$base:/ram/lower/$dir
+	fi
+	if [ $storage_rw = 1 ]; then
+		mkdir -p $STORAGE/$dir $WORK/$dir
+		if mount -t overlay overlay \
+			-o lowerdir=$base,upperdir=$STORAGE/$dir,workdir=$WORK/$dir \
+			$ROOT/$dir; then
+			return
+		fi
+		echo "WARNING: persistent overlay on /$dir failed; changes kept in RAM"
+	fi
+
+	lower=$base
+	if [ -d $STORAGE/$dir ]; then
+		lower=$STORAGE/$dir:$base
+	fi
+	mkdir -p /ram/upper/$dir /ram/work/$dir
+	mount -t overlay overlay \
+		-o lowerdir=$lower,upperdir=/ram/upper/$dir,workdir=/ram/work/$dir \
+		$ROOT/$dir
+}
+
+for path in $ROOT/*; do
+	dir=${path##*/}
+	if [ ! -d "$path" ] || [ -L "$path" ]; then
+		continue
+	fi
+	case $dir in
+	dev | proc | sys | tmp | var) ;;
+	*) overlay_dir "$dir" ;;
+	esac
+done
+
+if grep -q " $STORAGE " /proc/mounts; then
+	mount -o move $STORAGE $ROOT/mnt/storage ||
+		echo "WARNING: could not move the storage volume to /mnt/storage"
+fi
+
+# linux-baby-only files are bind-mounted from RAM so they never reach the
+# storage volume that stock firmware also uses.
+bind_file() {
+	src=$1
+	dst=$ROOT$2
+
+	if [ ! -e "$dst" ]; then
+		echo "WARNING: $2 missing in the SqueezeOS root; not replaced"
+		return
+	fi
+	cp -p "$src" /ram/
+	mount -o bind "/ram/${src##*/}" "$dst"
+}
+
+bind_file /squeezeos/rcS /etc/init.d/rcS
+bind_file /squeezeos/wlan /etc/init.d/wlan
+bind_file /squeezeos/wpa_supplicant /usr/sbin/wpa_supplicant
+bind_file /usr/lib/alsa-lib/libasound_module_pcm_babydsp.so \
+	/usr/lib/alsa-lib/libasound_module_pcm_babydsp.so
+
+# SqueezePlay Networking.lua with ath6kl chipset detection and signal level
+# (SqueezeOS 9.0.1 r17084 file plus a small patch); only over that exact file.
+networking=/usr/share/jive/jive/net/Networking.lua
+if [ "$(md5sum $ROOT$networking 2>/dev/null)" = \
+	"723e961a4dda47c9eb9159391cd5db0b  $ROOT$networking" ]; then
+	bind_file /squeezeos/Networking.lua $networking
+else
+	echo "WARNING: $networking is not the known SqueezeOS 9.0.1 r17084 file; not patched for ath6kl"
+fi
+
+# WLAN modules (post-build.sh) replace the stock 2.6.26 module directory.
+if [ -d /lib/modules ] && [ -d $ROOT/lib/modules ]; then
+	cp -a /lib/modules /ram/modules
+	mount -o bind /ram/modules $ROOT/lib/modules
+fi
+
+umount -l /ram
+
+mount -o move /dev $ROOT/dev
+mount -o move /proc $ROOT/proc
+mount -o move /sys $ROOT/sys
+exec switch_root $ROOT /sbin/init

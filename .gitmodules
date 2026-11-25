@@ -1,0 +1,9 @@
+[submodule "linux"]
+	path = linux
+	url = https://github.com/marek12306/linux-baby.git
+	branch = baby
+	shallow = true
+[submodule "buildroot"]
+	path = buildroot
+	url = https://github.com/buildroot/buildroot.git
+	shallow = true
