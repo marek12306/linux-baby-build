@@ -30,12 +30,14 @@ The result is in `out/`:
 | `zImage-<release>-drm-appended.md5` | its checksum |
 | `config-<release>` | the kernel configuration used |
 
-The kernel and Buildroot are git submodules: `linux/`
-([linux-baby](https://github.com/marek12306/linux-baby), branch `baby`) and
-`buildroot/` (upstream Buildroot, 2025.02.3). `build.sh` checks out the
+The kernel, Buildroot and the babydsp plugin are git submodules: `linux/`
+([linux-baby](https://github.com/marek12306/linux-baby), branch `baby`),
+`buildroot/` (upstream Buildroot, 2025.02.3) and `babydsp/`
+([babydsp](https://github.com/marek12306/babydsp)). `build.sh` checks out the
 commits they point to shallowly (the kernel down to its release tag, which the
-kernel release is counted from), builds both out of tree in `work/` and
-downloads all other sources to `work/dl`, checked against Buildroot's hashes.
+kernel release is counted from), builds them out of tree in `work/` and
+downloads all other sources to `work/dl`, checked against Buildroot's hashes
+or hashes in the scripts.
 A first build takes about 9 minutes on 8 cores and 3.5 GB in `work/`.
 Variables: `WORK` (work directory), `JOBS`. Building as root (e.g. in a
 container) needs `FORCE_UNSAFE_CONFIGURE=1` for Buildroot.
@@ -59,9 +61,10 @@ GitHub Actions runs `build.sh` on every push
 | Path | |
 |---|---|
 | `build.sh` | the build |
-| `linux/`, `buildroot/` | submodules: kernel and Buildroot |
+| `linux/`, `buildroot/`, `babydsp/` | submodules: kernel, Buildroot, crossover ALSA plugin |
 | `br2-external/` | Buildroot external tree: `squeezebox_radio_defconfig`, `post-build.sh`, rootfs overlay |
 | `scripts/build-wpa-supplicant.sh` | static wpa_supplicant 2.11 with nl80211 |
+| `scripts/build-babydsp.sh` | babydsp plugin with Bootlin's ARMv5 glibc toolchain against alsa-lib 1.0.18 |
 | `tools/ubitui/` | cfdisk-like UBI volume manager, built static |
 | `docs/INSTALL.md` | testing and installing an image |
 
@@ -76,15 +79,16 @@ the flash):
 | `squeezeos/wpa_supplicant` | `/usr/sbin/wpa_supplicant` | static, nl80211 |
 | `squeezeos/Networking.lua` | `/usr/share/jive/jive/net/Networking.lua` | SqueezePlay file with ath6kl detection (only over the known r17084 file) |
 | `lib/modules/` | `/lib/modules` | cfg80211, ath6kl (gzipped) |
-| `usr/lib/alsa-lib/libasound_module_pcm_babydsp.so` | same path | crossover plugin, prebuilt from [babydsp](https://github.com/marek12306/babydsp) (md5 `2e4d1384ca7788ecef77352df3ca48bf`) |
+| `usr/lib/alsa-lib/libasound_module_pcm_babydsp.so` | same path | crossover plugin built from `babydsp/` |
 | `squeezeos/ubitui` | `/sbin/ubitui` | in a RAM layer under the `/sbin` overlay |
 
-The babydsp plugin must match SqueezeOS's glibc and alsa-lib 1.0.18, which
-needs an old glibc toolchain; it is therefore committed prebuilt instead of
-being built here.
+The babydsp plugin is loaded by SqueezeOS's glibc 2.11.1 and alsa-lib 1.0.18,
+so it is built with a glibc toolchain (Bootlin `armv5-eabi--glibc--stable-2024.05-1`)
+against alsa-lib 1.0.18. That glibc is newer, but every function the plugin
+calls is versioned `GLIBC_2.4` on ARM EABI; `build-babydsp.sh` checks that.
 
 ## License
 
 GPL-2.0-or-later ([COPYING](COPYING)), except the files listed in
 [THIRD-PARTY.md](THIRD-PARTY.md) (SqueezePlay's `Networking.lua` is
-BSD-3-Clause, the babydsp plugin LGPL-2.1-or-later).
+BSD-3-Clause); the babydsp plugin in the image is LGPL-2.1-or-later.

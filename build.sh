@@ -1,14 +1,15 @@
 #!/bin/sh
 # Builds out/zImage-<release>-drm-appended: the linux-baby kernel with the
 # Buildroot initramfs embedded and the DRM (imx-lcdc) device tree appended,
-# i.e. the image RedBoot loads. The kernel and Buildroot are the commits the
-# submodules linux/ and buildroot/ point to; both are built out of tree.
+# i.e. the image RedBoot loads. The kernel, Buildroot and the babydsp plugin
+# are the commits the submodules linux/, buildroot/ and babydsp/ point to;
+# all are built out of tree.
 #
 # The kernel embeds the initramfs and the initramfs carries kernel modules,
 # so the kernel is built twice from the same tree:
 #   1. Buildroot toolchain (external Bootlin musl toolchain)
 #   2. kernel modules (and the kernel release they are built for)
-#   3. static wpa_supplicant and ubitui
+#   3. static wpa_supplicant and ubitui; babydsp (Bootlin glibc toolchain)
 #   4. Buildroot initramfs (post-build.sh adds 2 and 3)
 #   5. zImage with the initramfs, DTB appended
 #
@@ -38,7 +39,7 @@ step() {
 step "submodules"
 cd "$TOP"
 git submodule sync -q
-git submodule update --init --depth 1 buildroot
+git submodule update --init --depth 1 buildroot babydsp
 # scripts/setlocalversion counts the commits since the release tag (v7.3
 # for 7.3.0) for the kernel release 7.3.0-NNNNN-g<hash>, so the history
 # down to that tag is needed, plus the tag itself. The submodule is cloned
@@ -67,15 +68,17 @@ kmake vmlinux modules # modpost resolves module symbols against vmlinux
 release=$(cat "$KOUT/include/config/kernel.release")
 echo "kernel release $release"
 
-step "wpa_supplicant and ubitui"
+step "wpa_supplicant, ubitui and babydsp"
 export BUILDROOT CROSS DL
 OUTDIR=$WORK/wpa_supplicant sh "$TOP/scripts/build-wpa-supplicant.sh"
 OUTDIR=$WORK/ubitui sh "$TOP/tools/ubitui/build.sh"
+BABYDSP=$TOP/babydsp OUTDIR=$WORK/babydsp sh "$TOP/scripts/build-babydsp.sh"
 
 step "initramfs"
 export SQUEEZEBOX_LINUX="$KOUT"
 export SQUEEZEBOX_WPA="$WORK/wpa_supplicant/wpa_supplicant"
 export SQUEEZEBOX_UBITUI="$WORK/ubitui/ubitui"
+export SQUEEZEBOX_BABYDSP="$WORK/babydsp/libasound_module_pcm_babydsp.so"
 make -C "$BR_OUT"
 
 step "zImage with the initramfs"

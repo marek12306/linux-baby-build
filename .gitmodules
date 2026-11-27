@@ -7,3 +7,7 @@
 	path = buildroot
 	url = https://github.com/buildroot/buildroot.git
 	shallow = true
+[submodule "babydsp"]
+	path = babydsp
+	url = https://github.com/marek12306/babydsp.git
+	shallow = true
